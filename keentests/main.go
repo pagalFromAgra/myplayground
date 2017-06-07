@@ -30,10 +30,10 @@ func main() {
 	k, _ := keendevice.NewFromEnv()
 	company := keendevice.Company{
 		Keen:       k,          // Keen instance
-		Name:       "irmshred", // company name as stored in keen
+		Name:       os.Args[1], // company name as stored in keen
 		ShiftHours: 8}          // shift length in hours
 
-	checkdate := "2017-05-26"
+	checkdate := os.Args[2]
 
 	response, _ := company.GetData(
 		checkdate+"T00:00:00-00:00", // start of timeframe to get
@@ -53,7 +53,7 @@ func main() {
 	// --------
 	// STEP 3. Read the device keys from the exported employee csv
 	// --------
-	f, _ := os.Open("/Users/adityabansal/kineticdevs/go/src/github.com/wearkinetic/digger/export-irm.csv")
+	f, _ := os.Open(os.Args[3])
 	r := csv.NewReader(bufio.NewReader(f))
 	result, _ := r.ReadAll()
 
@@ -78,13 +78,20 @@ func main() {
 			log.Println("Couldn't read file list")
 		}
 
+		// Each file has either 1 data point (40ms) or 5mins (300s) of data
+		// len(list)*0.04 <= activetime <= len(list)*5*60
+
 		marker := ""
-		if activetime > len(list)*5*60 {
+		if activetime > (len(list)*5*60 + 3600) { // Because there can be 1 hr of overlap from the other day in Keen data
 			marker = "<--- missing S3 data"
 		}
 
-		if activetime < len(list)*5*48 {
+		if activetime < len(list)*2*60 { // At least on avg. 2 mins of data
 			marker = "<--- missing Keen data"
+		}
+
+		if activetime > 3600*12 {
+			marker = "<--- GREATER than 10 HRS"
 		}
 
 		fmt.Printf("%s\t%d\t%d\t%d\t%s\n", device, lifts, activetime, len(list), marker)
