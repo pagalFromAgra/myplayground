@@ -1,14 +1,14 @@
 package main
 
 import (
-	"bufio"
-	"encoding/csv"
 	"fmt"
 	"log"
 	"os"
 
 	"github.com/wearkinetic/awss3"
-	"github.com/wearkinetic/keendevice"
+	"github.com/wearkinetic/keen"
+
+	"github.com/wearkinetic/beutils"
 )
 
 type Result struct {
@@ -27,75 +27,111 @@ func main() {
 	// --------
 	// STEP 1. Get the data from Keen
 	// --------
-	k, _ := keendevice.NewFromEnv()
-	company := keendevice.Company{
+	k, err := keen.NewFromEnv()
+	company := keen.Company{
 		Keen:       k,          // Keen instance
 		Name:       os.Args[1], // company name as stored in keen
 		ShiftHours: 8}          // shift length in hours
+	if err != nil {
+		log.Fatal(err)
+	}
 
-	checkdate := os.Args[2]
+	client, errc := beutils.NewHTTPClient()
+	if errc != nil {
+		log.Fatal(errc)
+	}
 
-	response, _ := company.GetData(
-		checkdate+"T00:00:00-00:00", // start of timeframe to get
-		checkdate+"T23:59:59-00:00", // end of timeframe to get
-		"daily") // interval to group into
+	devicesAtlocation, err := beutils.GetAllDevicesAtLocation(client, company.Name)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println("devicesAtlocation = ", devicesAtlocation)
 
-	// responseByTimeframe := response.ByTimeframeByEmployee() // group first by timeframe then by employee for easy marshalling to JSON
-	// responseByEmployee := response.ByTimeframeByEmployee() // the reverse
+	startDate := os.Args[2]
+	endDate := os.Args[3]
 
-	// fmt.Println(goutil.Pretty(*responseByEmployee))
+	dates, err := beutils.GetDateRange(startDate, endDate)
+	if err != nil {
+		log.Fatal(err)
+	}
 
-	// --------
-	// STEP 2. Setup S3 session
-	// --------
-	session := awss3.NewSession(awss3.REGION_US_EAST_1)
+	for _, checkdate := range dates {
 
-	// --------
-	// STEP 3. Read the device keys from the exported employee csv
-	// --------
-	f, _ := os.Open(os.Args[3])
-	r := csv.NewReader(bufio.NewReader(f))
-	result, _ := r.ReadAll()
+		fmt.Printf("Checking for the date: %s\n", checkdate)
 
-	// --------
-	// STEP 4. For each device key assigned to the company, compare the data between Keen and S3
-	// --------
-	for _, row := range result {
+		response, err := company.GetData(
+			checkdate+"T00:00:00-00:00", // start of timeframe to get
+			checkdate+"T23:59:59-00:00", // end of timeframe to get
+			"daily") // interval to group into
+		if err != nil {
+			log.Fatal(err)
+		}
 
-		device := row[2]
-		lifts := 0
-		activetime := 0
+		// responseByTimeframe := response.ByTimeframeByEmployee() // group first by timeframe then by employee for easy marshalling to JSON
+		// responseByEmployee := response.ByTimeframeByEmployee() // the reverse
 
-		for _, dt := range *response.Employees {
-			if dt.ID == device {
-				lifts = dt.Lifts
-				activetime = dt.ActiveSeconds
+		// fmt.Println(goutil.Pretty(*responseByEmployee))
+
+		// --------
+		// STEP 2. Setup S3 session
+		// --------
+		session := awss3.NewSession(awss3.REGION_US_EAST_1)
+
+		// --------
+		// STEP 4. For each device key assigned to the company, compare the data between Keen and S3
+		// --------
+		countNoData := 0
+		for _, device := range devicesAtlocation {
+
+			// First check if this device is assigned to an employee
+			employeeName, employeeID := beutils.GetEmployeeInfo(client, device)
+			if employeeName == "" {
+				continue
+			}
+
+			lifts := 0
+			activetime := 0
+
+			for _, dt := range *response.Employees {
+				if dt.ID == employeeID {
+					lifts = dt.Lifts
+					activetime = dt.ActiveSeconds
+				}
+			}
+
+			list, err := session.List("kinetic-device-data", "raw/"+device+"/"+checkdate)
+			if err != nil {
+				log.Println("Couldn't read file list")
+			}
+
+			// Each file has either 1 data point (40ms) or 5mins (300s) of data
+			// len(list)*0.04 <= activetime <= len(list)*5*60
+
+			marker := ""
+			if activetime > (len(list)*5*60 + 3600) { // Because there can be 1 hr of overlap from the other day in Keen data
+				marker = "<--- missing S3 data"
+			}
+
+			if activetime < len(list)*1*6 && len(list) > 1 { // At least 1 sec of data and > 1 file in S3
+				marker = "<--- missing Keen data"
+			}
+
+			if activetime > 3600*15 {
+				marker = "<--- GREATER than 15 HRS"
+			}
+
+			if marker != "" {
+				employeeName, _ := beutils.GetEmployeeInfo(client, device)
+				fmt.Printf("%s\t%s\t%d\t%d\t%d\t%s\n", employeeName, device, lifts, activetime, len(list), marker)
+			}
+
+			if activetime == 0 && lifts == 0 && len(list) == 0 {
+				countNoData++
 			}
 		}
-
-		list, err := session.List("kinetic-device-data", "raw/"+device+"/"+checkdate)
-		if err != nil {
-			log.Println("Couldn't read file list")
-		}
-
-		// Each file has either 1 data point (40ms) or 5mins (300s) of data
-		// len(list)*0.04 <= activetime <= len(list)*5*60
-
-		marker := ""
-		if activetime > (len(list)*5*60 + 3600) { // Because there can be 1 hr of overlap from the other day in Keen data
-			marker = "<--- missing S3 data"
-		}
-
-		if activetime < len(list)*2*60 { // At least on avg. 2 mins of data
-			marker = "<--- missing Keen data"
-		}
-
-		if activetime > 3600*12 {
-			marker = "<--- GREATER than 10 HRS"
-		}
-
-		fmt.Printf("%s\t%d\t%d\t%d\t%s\n", device, lifts, activetime, len(list), marker)
+		fmt.Printf("%d/%d with no data\n\n", countNoData, len(devicesAtlocation))
 	}
+
 	//
 	// for _, row := range allinfo {
 	//
